@@ -1,6 +1,7 @@
 from typing import Union, Optional, Callable, Dict
 import warnings
 import torch
+import numpy as np
 
 import ase.data
 from ase.calculators.calculator import Calculator, all_changes
@@ -149,3 +150,9 @@ class NequIPCalculator(Calculator):
             # ase wants voigt format
             stress_voigt = full_3x3_to_voigt_6_stress(stress)
             self.results["stress"] = stress_voigt
+        if AtomicDataDict.PER_ATOM_STRESS_KEY in out:
+            stresses = out[AtomicDataDict.PER_ATOM_STRESS_KEY].detach().cpu().numpy()
+            stresses *= (self.energy_units_to_eV / self.length_units_to_A**3)
+            stresses_voigt = np.asarray([full_3x3_to_voigt_6_stress(stress) for stress in stresses])
+            self.results["stresses"] = - stresses_voigt
+

@@ -1,6 +1,7 @@
 from typing import List, Union, Optional
 
 import torch
+from torch_runstats.scatter import scatter
 
 from e3nn.o3 import Irreps
 from e3nn.util.jit import compile_mode
@@ -355,6 +356,207 @@ class StressOutput(GraphModuleMixin, torch.nn.Module):
 
         # Remove helper
         del data["_displacement"]
+        if not did_pos_req_grad:
+            # don't give later modules one that does
+            pos.requires_grad_(False)
+
+        return data
+
+@compile_mode("script")
+class StrainStressOutput(GraphModuleMixin, torch.nn.Module):
+    r"""Compute stress (and forces) using autograd from strain.
+
+    See:
+        Langer et. al. J. Chem. Phys., 17, 159, 2023
+        https://doi.org/10.1063/5.0155760
+
+    Args:
+        func: the energy model to wrap
+        do_forces: whether to compute forces as well
+    """
+
+    do_forces: bool
+
+    def __init__(
+        self,
+        func: GraphModuleMixin,
+        do_forces: bool = True,
+    ):
+        super().__init__()
+
+        if not do_forces:
+            raise NotImplementedError
+        self.do_forces = do_forces
+
+        self.func = func
+
+        # check and init irreps
+        self._init_irreps(
+            irreps_in=self.func.irreps_in.copy(),
+            irreps_out=self.func.irreps_out.copy(),
+        )
+        self.irreps_out[AtomicDataDict.FORCE_KEY] = "1o"
+        self.irreps_out[AtomicDataDict.STRESS_KEY] = "1o"
+        self.irreps_out[AtomicDataDict.VIRIAL_KEY] = "1o"
+        self.irreps_out[AtomicDataDict.PER_ATOM_STRESS_KEY] = "1o"
+
+        # for torchscript compat
+        self.register_buffer("_empty", torch.Tensor())
+
+    def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
+        assert AtomicDataDict.EDGE_VECTORS_KEY not in data
+
+        if AtomicDataDict.BATCH_KEY in data:
+            batch = data[AtomicDataDict.BATCH_KEY]
+            num_batch: int = len(data[AtomicDataDict.BATCH_PTR_KEY]) - 1
+        else:
+            # Special case for efficiency
+            data = AtomicDataDict.with_batch(data)
+            batch = data[AtomicDataDict.BATCH_KEY]
+            num_batch: int = 1
+
+        pos = data[AtomicDataDict.POSITIONS_KEY]
+
+        has_cell: bool = AtomicDataDict.CELL_KEY in data
+
+        if has_cell:
+            orig_cell = data[AtomicDataDict.CELL_KEY]
+            # Make the cell per-batch
+            cell = orig_cell.view(-1, 3, 3).expand(num_batch, 3, 3)
+            data[AtomicDataDict.CELL_KEY] = cell
+        else:
+            # torchscript
+            orig_cell = self._empty
+            cell = self._empty
+
+        # strain-stress and atomic stress
+        # Add the strain
+        strain = torch.zeros(
+            (3, 3),
+            dtype=pos.dtype,
+            device=pos.device,
+        )
+        if num_batch > 1:
+            # add n_batch dimension
+            strain = strain.view(-1, 3, 3).expand(num_batch, 3, 3)
+        strain.requires_grad_(True)
+        data["_strain"] = strain
+        did_pos_req_grad: bool = pos.requires_grad
+        pos.requires_grad_(True)
+        if num_batch > 1:
+            # bmm is natom in batch
+            # batched [natom, 1, 3] @ [natom, 3, 3] -> [natom, 1, 3] -> [natom, 3]
+            # strain positions
+            data[AtomicDataDict.POSITIONS_KEY] = pos + torch.bmm(
+                pos.unsqueeze(-2), torch.index_select(strain, 0, batch)
+            ).squeeze(-2)
+        else:
+            # [natom, 3] @ [3, 3] -> [natom, 3]
+            data[AtomicDataDict.POSITIONS_KEY] = torch.addmm(
+                pos, pos, strain
+            )
+        # assert torch.equal(pos, data[AtomicDataDict.POSITIONS_KEY])
+        # we only displace the cell if we have one:
+        if has_cell:
+            # bmm is num_batch in batch
+            # here we apply the distortion to the cell as well
+            # this is critical also for the correctness
+            # if we didn't symmetrize the distortion, since without this
+            # there would then be an infinitesimal rotation of the positions
+            # but not cell, and it thus wouldn't be global and have
+            # no effect due to equivariance/invariance.
+            if num_batch > 1:
+                # [n_batch, 3, 3] @ [n_batch, 3, 3]
+                data[AtomicDataDict.CELL_KEY] = cell + torch.bmm(
+                    cell, strain
+                )
+            else:
+                # [3, 3] @ [3, 3] --- enforced to these shapes
+                tmpcell = cell.squeeze(0)
+                data[AtomicDataDict.CELL_KEY] = torch.addmm(
+                    tmpcell, tmpcell, strain
+                ).unsqueeze(0)
+            # assert torch.equal(cell, data[AtomicDataDict.CELL_KEY])
+
+        # Call model and get gradients
+        data = self.func(data)
+
+        # get atomic stress (very inefficient implementation)
+        # d Ei / d strain  batched [natom] / [3,3] -> [natom, 3, 3]
+        # strain should only works in its own batch.
+        if num_batch > 1:
+            num_atoms = pos.shape[0] # batched number of atoms
+            atomic_virial = torch.zeros(
+                (num_atoms, 3, 3),
+                dtype=pos.dtype,
+                device=pos.device,
+            )
+            for i in range(num_atoms):
+                grad = torch.autograd.grad(
+                    [data[AtomicDataDict.PER_ATOM_ENERGY_KEY][i,0]],
+                    [data["_strain"]],
+                    create_graph=self.training,
+                    retain_graph=True,
+                    )[0]
+                if grad is not None:
+                    atomic_virial[i,:,:] = grad[batch[i],:,:]
+        else:
+            num_atoms = pos.shape[0] # number of atoms
+            atomic_virial = torch.zeros(
+                (num_atoms, 3, 3),
+                dtype=pos.dtype,
+                device=pos.device,
+            )
+            for i in range(num_atoms):
+                grad = torch.autograd.grad(
+                    [data[AtomicDataDict.PER_ATOM_ENERGY_KEY][i,0]],
+                    [data["_strain"]],
+                    create_graph=self.training,
+                    retain_graph=True,
+                    )[0]
+                if grad is not None:
+                    atomic_virial[i,:,:] = grad[:,:]
+
+        # Store virial
+        virial = scatter(atomic_virial, batch, dim=0, reduce="sum")
+        if virial is None:
+            # condition needed to unwrap optional for torchscript
+            assert False, "failed to compute virial autograd"
+        virial = virial.view(num_batch, 3, 3)
+
+        grads = torch.autograd.grad(
+            [data[AtomicDataDict.TOTAL_ENERGY_KEY].sum()],
+            [pos],
+            create_graph=self.training,  # needed to allow gradients of this output during training
+        )
+
+        # Put negative sign on forces
+        forces = grads[0]
+        if forces is None:
+            # condition needed to unwrap optional for torchscript
+            assert False, "failed to compute forces autograd"
+        forces = torch.neg(forces)
+        data[AtomicDataDict.FORCE_KEY] = forces
+
+        virial = (virial + virial.transpose(-1, -2)) / 2 # symmetric
+
+        # we only compute the stress (1/V * virial) if we have a cell whose volume we can compute
+        if has_cell:
+            volume = torch.linalg.det(cell).abs().unsqueeze(-1)
+            stress = virial / volume.view(num_batch, 1, 1)
+            data[AtomicDataDict.CELL_KEY] = orig_cell
+        else:
+            stress = self._empty  # torchscript
+            atomic_stress = self._empty  # torchscript
+
+        virial = torch.neg(virial)
+        atomic_stress = torch.neg(atomic_virial)
+        data[AtomicDataDict.STRESS_KEY] = stress
+        data[AtomicDataDict.VIRIAL_KEY] = virial
+        data[AtomicDataDict.PER_ATOM_STRESS_KEY] = atomic_stress
+
+        # Remove helper
+        del data["_strain"]
         if not did_pos_req_grad:
             # don't give later modules one that does
             pos.requires_grad_(False)
