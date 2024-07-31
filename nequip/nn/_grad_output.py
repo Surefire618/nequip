@@ -464,33 +464,6 @@ class StrainStressOutput(GraphModuleMixin, torch.nn.Module):
             data = self.func(data)
             return data[AtomicDataDict.PER_ATOM_ENERGY_KEY].squeeze(-1)
 
-        def batch_wrapper(strain: torch.Tensor, n_batch: int, batch_idx: list[int]) -> torch.Tensor:
-            nonlocal data
-            _strain = torch.zeros(
-                (num_batch, 3, 3),
-                dtype=pos.dtype,
-                device=pos.device,
-            )
-            _strain[n_batch,:,:] = strain
-            _strain.requires_grad_(True)
-            pos.requires_grad_(True)
-            # bmm is natom in batch
-            # batched [natom, 1, 3] @ [natom, 3, 3] -> [natom, 1, 3] -> [natom, 3]
-            data[AtomicDataDict.POSITIONS_KEY] = pos + torch.bmm(
-                pos.unsqueeze(-2), torch.index_select(_strain, 0, batch)
-            ).squeeze(-2)
-            # assert torch.equal(pos, data[AtomicDataDict.POSITIONS_KEY])
-            # we only displace the cell if we have one:
-            if has_cell:
-                # [n_batch, 3, 3] @ [n_batch, 3, 3]
-                data[AtomicDataDict.CELL_KEY] = cell + torch.bmm(
-                    cell, _strain
-                )
-
-            # Call model and get gradients
-            data = self.func(data)
-            return data[AtomicDataDict.PER_ATOM_ENERGY_KEY].squeeze(-1)[batch_idx]
-
         def wrapper(strain: torch.Tensor) -> torch.Tensor:
             nonlocal data
             # [natom, 3] @ [3, 3] -> [natom, 3]
@@ -513,13 +486,6 @@ class StrainStressOutput(GraphModuleMixin, torch.nn.Module):
         # get atomic stress (very inefficient implementation)
         # d Ei / d strain  batched [natom] / [3,3] -> [natom, 3, 3]
         # strain should only works in its own batch.
-        num_atoms = pos.shape[0] # batched number of atoms
-        atomic_virial = torch.zeros(
-            (num_atoms, 3, 3),
-            dtype=torch.float64, # FIXME
-            # dtype=pos.dtype, # FIXME
-            device=pos.device,
-        )
         if num_batch > 1:
             # print(f"{num_batch = }")
             jac = torch.autograd.functional.jacobian(
@@ -529,31 +495,14 @@ class StrainStressOutput(GraphModuleMixin, torch.nn.Module):
                 vectorize=self.vectorize,
                 strategy="forward-mode",
             )
-            # print(f"{jac.shape = }")
-            # print(f"{jac = }")
-            for n_batch in range(num_batch):
-                batch_i = data[AtomicDataDict.BATCH_PTR_KEY][n_batch]
-                batch_j = data[AtomicDataDict.BATCH_PTR_KEY][n_batch+1]
-                batch_idx = list(range(batch_i, batch_j))
-                # print(f"{batch_idx = }")
-                atomic_virial[batch_idx, :, :] = jac[batch_idx, n_batch, :, :]
-
-            # for n_batch in range(num_batch):
-            #     batch_i = data[AtomicDataDict.BATCH_PTR_KEY][n_batch]
-            #     batch_j = data[AtomicDataDict.BATCH_PTR_KEY][n_batch+1]
-            #     batch_idx = list(range(batch_i, batch_j))
-            #     print(f"{batch_idx = }")
-            #     jac = torch.autograd.functional.jacobian(
-            #         func=lambda s: batch_wrapper(s, n_batch, batch_idx),
-            #         inputs=data["_strain"][n_batch, :, :],
-            #         create_graph=self.training,  # needed to allow gradients of this output during training
-            #         # vectorize=self.vectorize,
-            #         # strategy="forward-mode",
-            #     )
-            #     atomic_virial[batch_idx, :, :] = jac
-            #     print(f"{jac = }")
-            # print(f"{num_batch = }")
-
+            num_atoms = jac.shape[0]
+            atomic_virial = torch.zeros(
+                (num_atoms, 3, 3),
+                dtype=jac.dtype,
+                device=jac.device,
+            )
+            for n_atoms in range(num_atoms):
+                atomic_virial[n_atoms,:,:] = jac[n_atoms,batch[n_atoms],:,:]
 
         else:
             jac = torch.autograd.functional.jacobian(
@@ -564,11 +513,6 @@ class StrainStressOutput(GraphModuleMixin, torch.nn.Module):
                 strategy="forward-mode",
             )
             atomic_virial = jac
-            # print(f"{jac = }")
-            # print(f"{num_batch = }")
-
-        # print(f"{atomic_virial.shape = }")
-        # print(f"{atomic_virial = }")
 
         # Store virial
         virial = scatter(atomic_virial, batch, dim=0, reduce="sum")
