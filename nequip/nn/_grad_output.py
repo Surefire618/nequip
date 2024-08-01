@@ -1,6 +1,7 @@
 from typing import List, Union, Optional
 
 import torch
+from functorch import jacfwd
 from torch_runstats.scatter import scatter
 
 from e3nn.o3 import Irreps
@@ -375,6 +376,7 @@ class StrainStressOutput(GraphModuleMixin, torch.nn.Module):
         do_forces: whether to compute forces as well
     """
 
+    vectorize: bool
     do_forces: bool
 
     def __init__(
@@ -437,32 +439,11 @@ class StrainStressOutput(GraphModuleMixin, torch.nn.Module):
             dtype=pos.dtype,
             device=pos.device,
         )
-        if num_batch > 1:
-            # add n_batch dimension
-            strain = strain.view(-1, 3, 3).expand(num_batch, 3, 3).clone() # For forward-mode AD
         strain.requires_grad_(True)
         data["_strain"] = strain
         did_pos_req_grad: bool = pos.requires_grad
         pos.requires_grad_(True)
-
-        def all_wrapper(strain: torch.Tensor) -> torch.Tensor:
-            nonlocal data
-            # bmm is natom in batch
-            # batched [natom, 1, 3] @ [natom, 3, 3] -> [natom, 1, 3] -> [natom, 3]
-            data[AtomicDataDict.POSITIONS_KEY] = pos + torch.bmm(
-                pos.unsqueeze(-2), torch.index_select(strain, 0, batch)
-            ).squeeze(-2)
-            # assert torch.equal(pos, data[AtomicDataDict.POSITIONS_KEY])
-            # we only displace the cell if we have one:
-            if has_cell:
-                # [n_batch, 3, 3] @ [n_batch, 3, 3]
-                data[AtomicDataDict.CELL_KEY] = cell + torch.bmm(
-                    cell, strain
-                )
-
-            # Call model and get gradients
-            data = self.func(data)
-            return data[AtomicDataDict.PER_ATOM_ENERGY_KEY].squeeze(-1)
+        cell.requires_grad_(True)
 
         def wrapper(strain: torch.Tensor) -> torch.Tensor:
             nonlocal data
@@ -473,11 +454,9 @@ class StrainStressOutput(GraphModuleMixin, torch.nn.Module):
             # assert torch.equal(pos, data[AtomicDataDict.POSITIONS_KEY])
             # we only displace the cell if we have one:
             if has_cell:
-                # [3, 3] @ [3, 3] --- enforced to these shapes
-                tmpcell = cell.squeeze(0)
-                data[AtomicDataDict.CELL_KEY] = torch.addmm(
-                    tmpcell, tmpcell, strain
-                ).unsqueeze(0)
+                data[AtomicDataDict.CELL_KEY] = cell + torch.bmm(
+                    cell, strain.view(-1, 3, 3).expand(num_batch, 3, 3) 
+                )
 
             # Call model and get gradients
             data = self.func(data)
@@ -486,33 +465,15 @@ class StrainStressOutput(GraphModuleMixin, torch.nn.Module):
         # get atomic stress (very inefficient implementation)
         # d Ei / d strain  batched [natom] / [3,3] -> [natom, 3, 3]
         # strain should only works in its own batch.
-        if num_batch > 1:
-            # print(f"{num_batch = }")
-            jac = torch.autograd.functional.jacobian(
-                func=all_wrapper,
-                inputs=data["_strain"],
-                # create_graph=self.training,  # needed to allow gradients of this output during training
-                vectorize=self.vectorize,
-                strategy="forward-mode",
-            )
-            num_atoms = jac.shape[0]
-            atomic_virial = torch.zeros(
-                (num_atoms, 3, 3),
-                dtype=jac.dtype,
-                device=jac.device,
-            )
-            for n_atoms in range(num_atoms):
-                atomic_virial[n_atoms,:,:] = jac[n_atoms,batch[n_atoms],:,:]
-
-        else:
-            jac = torch.autograd.functional.jacobian(
-                func=wrapper,
-                inputs=data["_strain"],
-                # create_graph=self.training,  # needed to allow gradients of this output during training
-                vectorize=self.vectorize,
-                strategy="forward-mode",
-            )
-            atomic_virial = jac
+        jac = torch.autograd.functional.jacobian(
+            func=wrapper,
+            inputs=data["_strain"],
+            create_graph=self.training,  # needed to allow gradients of this output during training
+            # vectorize=self.vectorize,
+            # strategy="forward-mode",
+        )
+        # jac = jacfwd(wrapper)(data["_strain"]) # this doesn't work, and I don't understand why!
+        atomic_virial = jac
 
         # Store virial
         virial = scatter(atomic_virial, batch, dim=0, reduce="sum")
