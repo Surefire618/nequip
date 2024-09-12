@@ -313,6 +313,7 @@ class StressOutput(GraphModuleMixin, torch.nn.Module):
             [data[AtomicDataDict.TOTAL_ENERGY_KEY].sum()],
             [pos, data["_displacement"]],
             create_graph=self.training,  # needed to allow gradients of this output during training
+            retain_graph=True,
         )
 
         # Put negative sign on forces
@@ -486,6 +487,7 @@ class StrainStressOutput(GraphModuleMixin, torch.nn.Module):
             [data[AtomicDataDict.TOTAL_ENERGY_KEY].sum()],
             [pos],
             create_graph=self.training,  # needed to allow gradients of this output during training
+            retain_graph=True,
         )
 
         # Put negative sign on forces

@@ -155,4 +155,4 @@ class NequIPCalculator(Calculator):
             stresses *= (self.energy_units_to_eV / self.length_units_to_A**3)
             stresses_voigt = np.asarray([full_3x3_to_voigt_6_stress(stress) for stress in stresses])
             self.results["stresses"] = - stresses_voigt
-
+        return self.results
